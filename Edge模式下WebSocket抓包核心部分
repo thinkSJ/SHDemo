@@ -1,0 +1,25 @@
+std::wstring eventNameR{ L"Network.webSocketFrameReceived" };
+  RETURN_IF_FAILED(webviewWindow->GetDevToolsProtocolEventReceiver(eventNameR.c_str(), &receiver_wsr));
+  RETURN_IF_FAILED(receiver_wsr->add_DevToolsProtocolEventReceived(
+    Callback<ICoreWebView2DevToolsProtocolEventReceivedEventHandler>(
+      [eventNameR](ICoreWebView2* sender, ICoreWebView2DevToolsProtocolEventReceivedEventArgs* args) -> HRESULT {
+        wil::unique_cotaskmem_string parameterObjectAsJson;
+        RETURN_IF_FAILED(args->get_ParameterObjectAsJson(&parameterObjectAsJson));
+        std::u16string ws = reinterpret_cast<char16_t*>(parameterObjectAsJson.get());
+        std::string ss = CStrConv::UTF16toUTF8(ws);
+        //LOGI("{}, {}", CStrConv::ToString(eventNameR), CStrConv::UTF8ToGBKSafe(ss));
+        return S_OK;
+      }).Get(), nullptr));
+
+  std::wstring eventNameS{ L"Network.webSocketFrameSent" };
+  RETURN_IF_FAILED(webviewWindow->GetDevToolsProtocolEventReceiver(eventNameS.c_str(), &receiver_wss));
+  RETURN_IF_FAILED(receiver_wss->add_DevToolsProtocolEventReceived(
+    Callback<ICoreWebView2DevToolsProtocolEventReceivedEventHandler>(
+      [eventNameS](ICoreWebView2* sender, ICoreWebView2DevToolsProtocolEventReceivedEventArgs* args) -> HRESULT {
+        wil::unique_cotaskmem_string parameterObjectAsJson;
+        RETURN_IF_FAILED(args->get_ParameterObjectAsJson(&parameterObjectAsJson));
+        std::u16string ws = reinterpret_cast<char16_t*>(parameterObjectAsJson.get());
+        std::string ss = CStrConv::UTF16toUTF8(ws);
+        //LOGI("{}, {}", CStrConv::ToString(eventNameS), CStrConv::UTF8ToGBKSafe(ss));
+        return S_OK;
+      }).Get(), nullptr));
