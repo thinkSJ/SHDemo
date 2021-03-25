@@ -1,0 +1,219 @@
+# IE模式下WebSocket抓包 
+
+#include "HookWSS.h"
+#include <thread>
+#include <chrono>
+#include <detours.h>
+#include <common/logger.h>
+#include <common/commondef.h>
+#include <common/EncodingConversion.h>
+#include <common/Utility.hpp>
+#include <common/memory_pool.h>
+#include <spdlog/fmt/bin_to_hex.h>
+#include <Packet.h>
+#include <PcapFileDevice.h>
+#include <EthLayer.h>
+#include <IPv4Layer.h>
+#include <TcpLayer.h>
+#include <PayloadLayer.h>
+using namespace std::this_thread;
+using namespace std::chrono_literals;
+
+//////////////////////////////////////////////////////////////////////////////
+MemoryPool<std::array<char, 4096>, 50> packet_pool_;
+enum class WS_BUF_TYPE:char
+{
+  HTTP_WEB_SOCKET_BINARY_MESSAGE_TYPE  = 0,
+  HTTP_WEB_SOCKET_BINARY_FRAGMENT_TYPE = 1,
+  HTTP_WEB_SOCKET_UTF8_MESSAGE_TYPE    = 2,
+  HTTP_WEB_SOCKET_UTF8_FRAGMENT_TYPE   = 3,
+  HTTP_WEB_SOCKET_CLOSE_TYPE           = 4,
+  HTTP_WEB_SOCKET_PING_TYPE            = 5
+};
+
+typedef void (*t_setcb)(HINTERNET hInternet, INTERNET_STATUS_CALLBACK lpfnInternetCallback);
+t_setcb org_setcb = nullptr;
+INTERNET_STATUS_CALLBACK org_cb = nullptr;
+
+typedef BOOL (*t_send)(HINTERNET, WS_BUF_TYPE, PVOID buffer, DWORD buf_len);
+t_send org_send = nullptr;
+
+typedef BOOL (*t_receive)(HINTERNET, PVOID buffer, DWORD buf_len, DWORD* pbyte_read, WS_BUF_TYPE*);
+t_receive org_receive = nullptr;
+
+HINTERNET   h_target = nullptr;
+std::shared_ptr<pcpp::PcapFileWriterDevice> pcap_write_ = nullptr;
+asio::io_context packet_context;
+asio::executor_work_guard<asio::io_context::executor_type> work(packet_context.get_executor());
+//////////////////////////////////////////////////////////////////////////////
+VOID CALLBACK  MyCallBadk(
+  _In_ HINTERNET hInternet,
+  _In_opt_ DWORD_PTR dwContext,
+  _In_ DWORD dwInternetStatus,
+  _In_opt_ LPVOID lpvStatusInformation,
+  _In_ DWORD dwStatusInformationLength)
+{
+  org_cb(hInternet, dwContext, dwInternetStatus, lpvStatusInformation, dwStatusInformationLength);
+ if (INTERNET_STATUS_REQUEST_COMPLETE == dwInternetStatus)
+  {
+    if (h_target != hInternet || nullptr == lpvStatusInformation || 0 == dwContext)
+      return;
+
+    char* buf = (char*)((PDWORD_PTR)dwContext)[17];
+    if (nullptr == buf)
+      return;
+
+    if (dwStatusInformationLength < 0x20)
+      return;
+    
+    auto buf_type = (WS_BUF_TYPE)(((int*)lpvStatusInformation)[5]);
+    DWORD len = *static_cast<DWORD*>(lpvStatusInformation);
+    auto item = packet_pool_.new_element();
+    if (nullptr != item)
+    {
+      DWORD hl = sizeof(WS_BUF_TYPE);
+      memmove(item->data(), &buf_type, hl);
+      memmove(item->data()+hl, buf, len);
+      HookWSS::SaveRecvData(item, len + hl);
+    }
+  }
+}
+
+void MySetCallBack(HINTERNET hInternet, INTERNET_STATUS_CALLBACK lpfnInternetCallback)
+{
+  org_cb = lpfnInternetCallback;
+  org_setcb(hInternet, MyCallBadk);
+}
+
+BOOL MySend(HINTERNET h, WS_BUF_TYPE type, PVOID buffer, DWORD buf_len)
+{
+  if (nullptr != buffer)
+  {
+    auto item = packet_pool_.new_element();
+    if (nullptr != item)
+    {
+      char h = (char)type;
+      memmove(item->data(), &h, sizeof(h));
+      memmove(item->data()+sizeof(h), buffer, buf_len);
+      HookWSS::SaveSendData(item, buf_len + sizeof(h));
+    }
+  }
+  return org_send(h, type, buffer, buf_len);
+}
+
+BOOL MyReceive(HINTERNET h, PVOID buffer, DWORD buf_len, DWORD* pbyte_read, WS_BUF_TYPE* ptype)
+{
+  h_target = h;
+  BOOL ret = org_receive(h, buffer, buf_len, pbyte_read, ptype);
+  if (ret)
+  {
+    auto item = packet_pool_.new_element();
+    if (nullptr != item)
+    {
+      DWORD hl = sizeof(WS_BUF_TYPE);
+      DWORD len = *pbyte_read + sizeof(WS_BUF_TYPE);
+      memmove(item->data(), ptype, hl);
+      memmove(item->data()+hl, buffer, *pbyte_read);
+      HookWSS::SaveRecvData(item, len);
+    }
+  }
+
+  return ret;
+}
+
+void HookWSS::SaveRecvData(std::array<char, 4096>*buf, size_t len)
+{
+  if (nullptr == buf)
+    return;
+  asio::post(packet_context.get_executor(), [=]{
+    pcpp::EthLayer Eth(pcpp::MacAddress("dd:dd:dd:dd:dd:dd"), pcpp::MacAddress("cc:cc:cc:cc:cc"));
+    pcpp::IPv4Layer IP(pcpp::IPv4Address(std::string("100.0.0.1")), pcpp::IPv4Address(std::string("192.168.1.1")));
+    pcpp::TcpLayer Tcp(443, 9999);
+    pcpp::PayloadLayer pl((uint8_t*)buf->data(), len, true);
+    
+    pcpp::Packet rPacket(len );
+    rPacket.addLayer(&Eth);
+    rPacket.addLayer(&IP);
+    rPacket.addLayer(&Tcp);
+    rPacket.addLayer(&pl);
+    rPacket.computeCalculateFields();
+    pcap_write_->writePacket(*(rPacket.getRawPacket()));
+    packet_pool_.delete_element(buf);
+  });
+}
+
+void HookWSS::SaveSendData(std::array<char, 4096>*buf, size_t len)
+{
+  if (nullptr == buf)
+    return;
+  asio::post(packet_context.get_executor(), [=] {
+    pcpp::EthLayer Eth(pcpp::MacAddress("cc:cc:cc:cc:cc"), pcpp::MacAddress("dd:dd:dd:dd:dd:dd"));
+    pcpp::IPv4Layer IP(pcpp::IPv4Address(std::string("192.168.1.1")), pcpp::IPv4Address(std::string("100.0.0.1")));
+    pcpp::TcpLayer Tcp(9999, 443);
+    pcpp::PayloadLayer pl((uint8_t*)buf->data(), len, true);
+
+    pcpp::Packet sPacket(len);
+    sPacket.addLayer(&Eth);
+    sPacket.addLayer(&IP);
+    sPacket.addLayer(&Tcp);
+    sPacket.addLayer(&pl);
+    sPacket.computeCalculateFields();
+    pcap_write_->writePacket(*(sPacket.getRawPacket()));
+    packet_pool_.delete_element(buf);
+  });
+}
+
+bool HookWSS::StartHook()
+{
+  // pcap 
+  auto path = BuildLogFile("wss_", ".pcap");
+  pcap_write_ = std::make_shared<pcpp::PcapFileWriterDevice>(path.c_str(), pcpp::LINKTYPE_ETHERNET);
+  if (!pcap_write_->open())
+  {
+    LOGI("创建抓包文件失败");
+  }
+  else {
+    std::thread t([] {
+      LOGI("已启动WSS抓包");
+      packet_context.run();
+      });
+    t.detach();
+  }
+
+  // HOOK function
+  HMODULE hMOD = ::GetModuleHandle("Wininet.dll");
+  if (nullptr == hMOD)
+    hMOD = ::LoadLibraryA("Wininet.dll");
+  if (nullptr == hMOD)
+    return false;
+
+  auto log_info = [](void* ptr, const char* str_name) {
+    if (nullptr == ptr)
+      LOGI("{} error", str_name);
+    else
+      LOGI("{} success", str_name);
+  };
+  using namespace Detours::X64;
+  using Detours::uint8_t;
+  org_setcb = (t_setcb)::GetProcAddress(hMOD, "InternetSetStatusCallbackW");
+  if (nullptr != org_setcb)
+  {
+    org_setcb = (t_setcb)DetourFunction((uint8_t*)org_setcb, (uint8_t*)MySetCallBack);
+    log_info(org_setcb, "fuck set callback");
+  }
+
+  org_send = (t_send)::GetProcAddress(hMOD, "HttpWebSocketSend");
+  if (nullptr != org_send)
+  {
+    org_send = (t_send)DetourFunction((uint8_t*)org_send, (uint8_t*)MySend);
+    log_info(org_send, "fuck send");
+  }
+
+  org_receive = (t_receive)::GetProcAddress(hMOD, "HttpWebSocketReceive");
+  if (nullptr != org_receive)
+  {
+    org_receive = (t_receive)DetourFunction((uint8_t*)org_receive, (uint8_t*)MyReceive);
+    log_info(org_receive, "fuck receive");
+  }
+  return true;
+}
